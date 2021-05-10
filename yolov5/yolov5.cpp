@@ -265,16 +265,27 @@ int main(int argc, char** argv) {
     // Create stream
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
+    std::cout << "xxxxxxxxxxxxx" << std::endl;
+    cv::VideoCapture cap("/dev/video1");
+
+    std::cout << "xxxxxxxxxxxxx" << std::endl;
+    if(!cap.isOpened()){
+       std::cout << "Error opening video stream or file" << std::endl;
+       return -1;
+    }
+    std::cout << "xxxxxxxxxxxxx" << std::endl;
 
     int fcount = 0;
-    for (int f = 0; f < (int)file_names.size(); f++) {
+    for (int f = 0; f < 1000; f++) { //(int)file_names.size(); f++) {
         fcount++;
         if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
-        for (int b = 0; b < fcount; b++) {
-            cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
+	    cv::Mat img;
+	    cap >> img;
+            //cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
             if (img.empty()) continue;
             cv::Mat pr_img = preprocess_img(img, INPUT_W, INPUT_H); // letterbox BGR to RGB
             int i = 0;
+	    int b = 0;
             for (int row = 0; row < INPUT_H; ++row) {
                 uchar* uc_pixel = pr_img.data + row * pr_img.step;
                 for (int col = 0; col < INPUT_W; ++col) {
@@ -285,7 +296,8 @@ int main(int argc, char** argv) {
                     ++i;
                 }
             }
-        }
+
+	std::cout << f << "xxxxxxxxxxxxx" << std::endl;
 
         // Run inference
         auto start = std::chrono::system_clock::now();
@@ -297,17 +309,17 @@ int main(int argc, char** argv) {
             auto& res = batch_res[b];
             nms(res, &prob[b * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
         }
-        for (int b = 0; b < fcount; b++) {
             auto& res = batch_res[b];
             //std::cout << res.size() << std::endl;
-            cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
+            //cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
             for (size_t j = 0; j < res.size(); j++) {
                 cv::Rect r = get_rect(img, res[j].bbox);
                 cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
                 cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
             }
-            cv::imwrite("_" + file_names[f - fcount + 1 + b], img);
-        }
+	    cv::imshow( "Frame", img );
+	    if( cv::waitKey(10) == 27 ) break;
+
         fcount = 0;
     }
 
