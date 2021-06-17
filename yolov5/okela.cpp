@@ -16,7 +16,7 @@
 static const int INPUT_H = Yolo::INPUT_H;
 static const int INPUT_W = Yolo::INPUT_W;
 static const int CLASS_NUM = Yolo::CLASS_NUM;
-static const int OUTPUT_SIZE = Yolo::MAX_OUTPUT_BBOX_COUNT * sizeof(Yolo::Detection) / sizeof(float) + 1;  // we assume the yololayer outputs no more than MAX_OUTPUT_BBOX_COUNT boxes that conf >= 0.1
+static const int OUTPUT_SIZE = 32768; //Yolo::MAX_OUTPUT_BBOX_COUNT * sizeof(Yolo::Detection) / sizeof(float) + 1;  // we assume the yololayer outputs no more than MAX_OUTPUT_BBOX_COUNT boxes that conf >= 0.1
 const char* INPUT_BLOB_NAME = "data";
 const char* OUTPUT_BLOB_NAME = "prob";
 static Logger gLogger;
@@ -37,11 +37,88 @@ static int get_depth(int x, float gd) {
     }
 }
 
+IScaleLayer* addBatchNorm2d1(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, float eps) {
+    float *gamma = (float*)weightMap[lname + ".weight"].values;
+    float *beta = (float*)weightMap[lname + ".bias"].values;
+    float *mean = (float*)weightMap[lname + ".running_mean"].values;
+    float *var = (float*)weightMap[lname + ".running_var"].values;
+    int len = weightMap[lname + ".running_var"].count;
+    std::cout << "len " << len << std::endl;
+
+    float *scval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
+    for (int i = 0; i < len; i++) {
+        scval[i] = gamma[i] / sqrt(var[i] + eps);
+    }
+    Weights scale{DataType::kFLOAT, scval, len};
+    
+    float *shval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
+    for (int i = 0; i < len; i++) {
+        shval[i] = beta[i] - mean[i] * gamma[i] / sqrt(var[i] + eps);
+    }
+    Weights shift{DataType::kFLOAT, shval, len};
+
+    float *pval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
+    for (int i = 0; i < len; i++) {
+        pval[i] = 1.0;
+    }
+    Weights power{DataType::kFLOAT, pval, len};
+
+    weightMap[lname + ".scale"] = scale;
+    weightMap[lname + ".shift"] = shift;
+    weightMap[lname + ".power"] = power;
+    IScaleLayer* scale_1 = network->addScale(input, ScaleMode::kCHANNEL, shift, scale, power);
+    assert(scale_1);
+    return scale_1;
+}
+
+IActivationLayer* bottleneck(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int inch, int outch, int stride, std::string lname) {
+    Weights emptywts{DataType::kFLOAT, nullptr, 0};
+
+    IConvolutionLayer* conv1 = network->addConvolutionNd(input, outch, DimsHW{1, 1}, weightMap[lname + "conv1.weight"], emptywts);
+    assert(conv1);
+
+    IScaleLayer* bn1 = addBatchNorm2d1(network, weightMap, *conv1->getOutput(0), lname + "bn1", 1e-5);
+
+    IActivationLayer* relu1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
+    assert(relu1);
+
+    IConvolutionLayer* conv2 = network->addConvolutionNd(*relu1->getOutput(0), outch, DimsHW{3, 3}, weightMap[lname + "conv2.weight"], emptywts);
+    assert(conv2);
+    conv2->setStrideNd(DimsHW{stride, stride});
+    conv2->setPaddingNd(DimsHW{1, 1});
+
+    IScaleLayer* bn2 = addBatchNorm2d1(network, weightMap, *conv2->getOutput(0), lname + "bn2", 1e-5);
+
+    IActivationLayer* relu2 = network->addActivation(*bn2->getOutput(0), ActivationType::kRELU);
+    assert(relu2);
+
+    IConvolutionLayer* conv3 = network->addConvolutionNd(*relu2->getOutput(0), outch * 4, DimsHW{1, 1}, weightMap[lname + "conv3.weight"], emptywts);
+    assert(conv3);
+
+    IScaleLayer* bn3 = addBatchNorm2d1(network, weightMap, *conv3->getOutput(0), lname + "bn3", 1e-5);
+
+    IElementWiseLayer* ew1;
+    if (stride != 1 || inch != outch * 4) {
+        IConvolutionLayer* conv4 = network->addConvolutionNd(input, outch * 4, DimsHW{1, 1}, weightMap[lname + "downsample.0.weight"], emptywts);
+        assert(conv4);
+        conv4->setStrideNd(DimsHW{stride, stride});
+
+        IScaleLayer* bn4 = addBatchNorm2d1(network, weightMap, *conv4->getOutput(0), lname + "downsample.1", 1e-5);
+        ew1 = network->addElementWise(*bn4->getOutput(0), *bn3->getOutput(0), ElementWiseOperation::kSUM);
+    } else {
+        ew1 = network->addElementWise(input, *bn3->getOutput(0), ElementWiseOperation::kSUM);
+    }
+    IActivationLayer* relu3 = network->addActivation(*ew1->getOutput(0), ActivationType::kRELU);
+    assert(relu3);
+    return relu3;
+}
+
 ICudaEngine* build_engine(unsigned int maxBatchSize, IBuilder* builder, IBuilderConfig* config, DataType dt, float& gd, float& gw, std::string& wts_name) {
     INetworkDefinition* network = builder->createNetworkV2(0U);
     std::cout << gd << " " << gw << "\n";
 
     // Create input tensor of shape {3, INPUT_H, INPUT_W} with name INPUT_BLOB_NAME
+    std::cout << INPUT_H << " " << INPUT_W << "\n";
     ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{ 3, INPUT_H, INPUT_W });
     assert(data);
 
@@ -51,15 +128,57 @@ ICudaEngine* build_engine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     /* ------ yolov5 backbone------ */
     auto focus0 = focus(network, weightMap, *data, 3, get_width(64, gw), 3, "model.0");
     auto conv1 = convBlock(network, weightMap, *focus0->getOutput(0), get_width(128, gw), 3, 2, 1, "model.1");
-    auto bottleneck_CSP2 = C3(network, weightMap, *conv1->getOutput(0), get_width(128, gw), get_width(128, gw), get_depth(3, gd), true, 1, 0.5, "model.2");
-    auto conv3 = convBlock(network, weightMap, *bottleneck_CSP2->getOutput(0), get_width(256, gw), 3, 2, 1, "model.3");
-    auto bottleneck_csp4 = C3(network, weightMap, *conv3->getOutput(0), get_width(256, gw), get_width(256, gw), get_depth(9, gd), true, 1, 0.5, "model.4");
-    auto conv5 = convBlock(network, weightMap, *bottleneck_csp4->getOutput(0), get_width(512, gw), 3, 2, 1, "model.5");
-    auto bottleneck_csp6 = C3(network, weightMap, *conv5->getOutput(0), get_width(512, gw), get_width(512, gw), get_depth(9, gd), true, 1, 0.5, "model.6");
-    auto conv7 = convBlock(network, weightMap, *bottleneck_csp6->getOutput(0), get_width(1024, gw), 3, 2, 1, "model.7");
-    auto spp8 = SPP(network, weightMap, *conv7->getOutput(0), get_width(1024, gw), get_width(1024, gw), 5, 9, 13, "model.8");
+    
+    IActivationLayer* x1 = bottleneck(network, weightMap, *conv1->getOutput(0), 64, 64, 1, "backbone.layer1.0.");
+    x1 = bottleneck(network, weightMap, *x1->getOutput(0), 256, 64, 1, "backbone.layer1.1.");
+    x1 = bottleneck(network, weightMap, *x1->getOutput(0), 256, 64, 1, "backbone.layer1.2.");
 
+    IActivationLayer* x2 = bottleneck(network, weightMap, *x1->getOutput(0), 256, 128, 2, "backbone.layer2.0.");
+    x2 = bottleneck(network, weightMap, *x2->getOutput(0), 512, 128, 1, "backbone.layer2.1.");
+    x2 = bottleneck(network, weightMap, *x2->getOutput(0), 512, 128, 1, "backbone.layer2.2.");
+    x2 = bottleneck(network, weightMap, *x2->getOutput(0), 512, 128, 1, "backbone.layer2.3.");
+
+    IActivationLayer* x3 = bottleneck(network, weightMap, *x2->getOutput(0), 512, 256, 2, "backbone.layer3.0.");
+    x3 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 256, 1, "backbone.layer3.1.");
+    x3 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 256, 1, "backbone.layer3.2.");
+    x3 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 256, 1, "backbone.layer3.3.");
+    x3 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 256, 1, "backbone.layer3.4.");
+    x3 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 256, 1, "backbone.layer3.5.");
+
+    IActivationLayer* x4 = bottleneck(network, weightMap, *x3->getOutput(0), 1024, 512, 2, "backbone.layer4.0.");
+    x4 = bottleneck(network, weightMap, *x4->getOutput(0), 2048, 512, 1, "backbone.layer4.1.");
+    x4 = bottleneck(network, weightMap, *x4->getOutput(0), 2048, 512, 1, "backbone.layer4.2.");
+
+    IConvolutionLayer* bottleneck_CSP2 = network->addConvolutionNd(*x1->getOutput(0), 64, DimsHW{1, 1}, weightMap["crop1.weight"], emptywts);
+    assert(bottleneck_CSP2);
+    bottleneck_CSP2->setStrideNd(DimsHW{1, 1});
+    bottleneck_CSP2->setPaddingNd(DimsHW{0, 0});
+
+    IConvolutionLayer* bottleneck_csp4 = network->addConvolutionNd(*x2->getOutput(0), 128, DimsHW{1, 1}, weightMap["crop2.weight"], emptywts);
+    assert(bottleneck_csp4);
+    bottleneck_csp4->setStrideNd(DimsHW{1, 1});
+    bottleneck_csp4->setPaddingNd(DimsHW{0, 0});
+
+    IConvolutionLayer* bottleneck_csp6 = network->addConvolutionNd(*x3->getOutput(0), 256, DimsHW{1, 1}, weightMap["crop3.weight"], emptywts);
+    assert(bottleneck_csp6);
+    bottleneck_csp6->setStrideNd(DimsHW{1, 1});
+    bottleneck_csp6->setPaddingNd(DimsHW{0, 0});
+
+    IConvolutionLayer* spp8 = network->addConvolutionNd(*x4->getOutput(0), 512, DimsHW{1, 1}, weightMap["crop4.weight"], emptywts);
+    assert(spp8);
+    spp8->setStrideNd(DimsHW{1, 1});
+    spp8->setPaddingNd(DimsHW{0, 0});
+    
+    //auto bottleneck_CSP2 = C3(network, weightMap, *conv1->getOutput(0), get_width(128, gw), get_width(128, gw), get_depth(3, gd), true, 1, 0.5, "model.2");
+    auto conv3 = convBlock(network, weightMap, *bottleneck_CSP2->getOutput(0), get_width(256, gw), 3, 2, 1, "model.3");
+    //auto bottleneck_csp4 = C3(network, weightMap, *conv3->getOutput(0), get_width(256, gw), get_width(256, gw), get_depth(9, gd), true, 1, 0.5, "model.4");
+    auto conv5 = convBlock(network, weightMap, *bottleneck_csp4->getOutput(0), get_width(512, gw), 3, 2, 1, "model.5");
+    //auto bottleneck_csp6 = C3(network, weightMap, *conv5->getOutput(0), get_width(512, gw), get_width(512, gw), get_depth(9, gd), true, 1, 0.5, "model.6");
+    auto conv7 = convBlock(network, weightMap, *bottleneck_csp6->getOutput(0), get_width(1024, gw), 3, 2, 1, "model.7");
+    //auto spp8 = SPP(network, weightMap, *conv7->getOutput(0), get_width(1024, gw), get_width(1024, gw), 5, 9, 13, "model.8");
+    
     /* ------ yolov5 head ------ */
+    
     auto bottleneck_csp9 = C3(network, weightMap, *spp8->getOutput(0), get_width(1024, gw), get_width(1024, gw), get_depth(3, gd), false, 1, 0.5, "model.9");
     auto conv10 = convBlock(network, weightMap, *bottleneck_csp9->getOutput(0), get_width(512, gw), 1, 1, 1, "model.10");
 
@@ -98,12 +217,13 @@ ICudaEngine* build_engine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     IConvolutionLayer* det2 = network->addConvolutionNd(*bottleneck_csp23->getOutput(0), 3 * (Yolo::CLASS_NUM + 5), DimsHW{ 1, 1 }, weightMap["model.24.m.2.weight"], weightMap["model.24.m.2.bias"]);
 
     auto yolo = addYoLoLayer(network, weightMap, det0, det1, det2);
-    yolo->getOutput(0)->setName(OUTPUT_BLOB_NAME);
-    network->markOutput(*yolo->getOutput(0));
+
+    bottleneck_csp23->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    network->markOutput(*bottleneck_csp23->getOutput(0));
 
     // Build engine
     builder->setMaxBatchSize(maxBatchSize);
-    config->setMaxWorkspaceSize(16 * (1 << 20));  // 16MB
+    config->setMaxWorkspaceSize(16 * (1 << 24));  // 16MB
 #if defined(USE_FP16)
     config->setFlag(BuilderFlag::kFP16);
 #elif defined(USE_INT8)
@@ -242,8 +362,8 @@ int main(int argc, char** argv) {
 
     // prepare input data ---------------------------
     static float data[BATCH_SIZE * 3 * INPUT_H * INPUT_W];
-    //for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
-    //    data[i] = 1.0;
+    for (int i = 0; i < 3 * INPUT_H * INPUT_W; i++)
+        data[i] = 1.0;
     static float prob[BATCH_SIZE * OUTPUT_SIZE];
     IRuntime* runtime = createInferRuntime(gLogger);
     assert(runtime != nullptr);
@@ -264,68 +384,16 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&buffers[inputIndex], BATCH_SIZE * 3 * INPUT_H * INPUT_W * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&buffers[outputIndex], BATCH_SIZE * OUTPUT_SIZE * sizeof(float)));
     // Create stream
+
     cudaStream_t stream;
     CUDA_CHECK(cudaStreamCreate(&stream));
-    std::cout << "xxxxxxxxxxxxx" << std::endl;
-    cv::VideoCapture cap("/dev/video1");
 
-    std::cout << "xxxxxxxxxxxxx" << std::endl;
-    if(!cap.isOpened()){
-       std::cout << "Error opening video stream or file" << std::endl;
-       return -1;
-    }
-    std::cout << "xxxxxxxxxxxxx" << std::endl;
-
-    int fcount = 0;
-    for (int f = 0; f < 1000; f++) { //(int)file_names.size(); f++) {
-        fcount++;
-        if (fcount < BATCH_SIZE && f + 1 != (int)file_names.size()) continue;
-	    cv::Mat img;
-	    cap >> img;
-            //cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
-            if (img.empty()) continue;
-            cv::Mat pr_img = preprocess_img(img, INPUT_W, INPUT_H); // letterbox BGR to RGB
-            int i = 0;
-	    int b = 0;
-            for (int row = 0; row < INPUT_H; ++row) {
-                uchar* uc_pixel = pr_img.data + row * pr_img.step;
-                for (int col = 0; col < INPUT_W; ++col) {
-                    data[b * 3 * INPUT_H * INPUT_W + i] = (float)uc_pixel[2] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + INPUT_H * INPUT_W] = (float)uc_pixel[1] / 255.0;
-                    data[b * 3 * INPUT_H * INPUT_W + i + 2 * INPUT_H * INPUT_W] = (float)uc_pixel[0] / 255.0;
-                    uc_pixel += 3;
-                    ++i;
-                }
-            }
-
-	std::cout << f << "xxxxxxxxxxxxx" << std::endl;
-
-        // Run inference
-        auto start = std::chrono::system_clock::now();
-        doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
-        auto end = std::chrono::system_clock::now();
-        std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
-        std::vector<std::vector<Yolo::Detection>> batch_res(fcount);
-        for (int b = 0; b < fcount; b++) {
-            auto& res = batch_res[b];
-            nms(res, &prob[b * OUTPUT_SIZE], CONF_THRESH, NMS_THRESH);
-        }
-            auto& res = batch_res[b];
-            //std::cout << res.size() << std::endl;
-            //cv::Mat img = cv::imread(img_dir + "/" + file_names[f - fcount + 1 + b]);
-            for (size_t j = 0; j < res.size(); j++) {
-                cv::Rect r = get_rect(img, res[j].bbox);
-                cv::rectangle(img, r, cv::Scalar(0x27, 0xC1, 0x36), 2);
-                cv::putText(img, std::to_string((int)res[j].class_id), cv::Point(r.x, r.y - 1), cv::FONT_HERSHEY_PLAIN, 1.2, cv::Scalar(0xFF, 0xFF, 0xFF), 2);
-            }
-	    cv::imshow( "Frame", img );
-	    if( cv::waitKey(10) == 27 ) break;
-
-        fcount = 0;
-    }
+    auto start = std::chrono::system_clock::now();
+    doInference(*context, stream, buffers, data, prob, BATCH_SIZE);
+    auto end = std::chrono::system_clock::now();
+    std::cout << std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count() << "ms" << std::endl;
 
     // Release stream and buffers
-    cudaStreamDestroy(stream);
     CUDA_CHECK(cudaFree(buffers[inputIndex]));
     CUDA_CHECK(cudaFree(buffers[outputIndex]));
     // Destroy the engine
@@ -334,13 +402,19 @@ int main(int argc, char** argv) {
     runtime->destroy();
 
     // Print histogram of the output distribution
-    //std::cout << "\nOutput:\n\n";
-    //for (unsigned int i = 0; i < OUTPUT_SIZE; i++)
-    //{
-    //    std::cout << prob[i] << ", ";
-    //    if (i % 10 == 0) std::cout << std::endl;
-    //}
-    //std::cout << std::endl;
-
+    std::cout << "\nOutput:\n\n" << INPUT_H << " " << INPUT_W << " " << OUTPUT_SIZE << "\n";
+    for (unsigned int i = 0; i < 10; i++)
+    {
+        std::cout << prob[i] << ", ";
+        if (i % 10 == 0) std::cout << "okela" << std::endl;
+    }
+    std::cout << std::endl;
+    
+    std::cout << "\nOutput:\n\n" << INPUT_H << " " << INPUT_W << " " << OUTPUT_SIZE << "\n";
+    for (unsigned int i = 0; i < 10; i++)
+    {
+        std::cout << prob[OUTPUT_SIZE - i] << ", ";
+        if (i % 10 == 0) std::cout << "okela" << std::endl;
+    }
     return 0;
 }

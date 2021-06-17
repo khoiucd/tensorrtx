@@ -33,12 +33,5 @@ target_link_libraries(yolov5 cudart)
 target_link_libraries(yolov5 myplugins)
 target_link_libraries(yolov5 ${OpenCV_LIBS})
 
-add_executable(resnet17 ${PROJECT_SOURCE_DIR}/calibrator.cpp ${PROJECT_SOURCE_DIR}/resnet17.cpp)
-target_link_libraries(resnet17 nvinfer)
-target_link_libraries(resnet17 cudart)
-target_link_libraries(resnet17 myplugins)
-target_link_libraries(resnet17 ${OpenCV_LIBS})
-
-
 add_definitions(-O2 -pthread)
 

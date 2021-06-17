@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 
+
 #define CHECK(status) \
     do\
     {\
@@ -20,10 +21,10 @@
         }\
     } while (0)
 
-// stuff we know about the network and the input/output blobs
-static const int INPUT_H = 64;
-static const int INPUT_W = 64;
-static const int OUTPUT_SIZE = 1048576;
+
+static const int INPUT_H = 224;
+static const int INPUT_W = 224;
+static const int OUTPUT_SIZE = 12845056;
 
 const char* INPUT_BLOB_NAME = "data";
 const char* OUTPUT_BLOB_NAME = "prob";
@@ -66,7 +67,7 @@ std::map<std::string, Weights> loadWeights(const std::string file)
             input >> std::hex >> val[x];
         }
         wt.values = val;
-        
+
         wt.count = size;
         weightMap[name] = wt;
     }
@@ -74,83 +75,6 @@ std::map<std::string, Weights> loadWeights(const std::string file)
     return weightMap;
 }
 
-IScaleLayer* addBatchNorm2d(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, std::string lname, float eps) {
-    float *gamma = (float*)weightMap[lname + ".weight"].values;
-    float *beta = (float*)weightMap[lname + ".bias"].values;
-    float *mean = (float*)weightMap[lname + ".running_mean"].values;
-    float *var = (float*)weightMap[lname + ".running_var"].values;
-    int len = weightMap[lname + ".running_var"].count;
-    std::cout << "len " << len << std::endl;
-
-    float *scval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
-    for (int i = 0; i < len; i++) {
-        scval[i] = gamma[i] / sqrt(var[i] + eps);
-    }
-    Weights scale{DataType::kFLOAT, scval, len};
-    
-    float *shval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
-    for (int i = 0; i < len; i++) {
-        shval[i] = beta[i] - mean[i] * gamma[i] / sqrt(var[i] + eps);
-    }
-    Weights shift{DataType::kFLOAT, shval, len};
-
-    float *pval = reinterpret_cast<float*>(malloc(sizeof(float) * len));
-    for (int i = 0; i < len; i++) {
-        pval[i] = 1.0;
-    }
-    Weights power{DataType::kFLOAT, pval, len};
-
-    weightMap[lname + ".scale"] = scale;
-    weightMap[lname + ".shift"] = shift;
-    weightMap[lname + ".power"] = power;
-    IScaleLayer* scale_1 = network->addScale(input, ScaleMode::kCHANNEL, shift, scale, power);
-    assert(scale_1);
-    return scale_1;
-}
-
-IActivationLayer* bottleneck(INetworkDefinition *network, std::map<std::string, Weights>& weightMap, ITensor& input, int inch, int outch, int stride, std::string lname) {
-    Weights emptywts{DataType::kFLOAT, nullptr, 0};
-
-    IConvolutionLayer* conv1 = network->addConvolutionNd(input, outch, DimsHW{1, 1}, weightMap[lname + "conv1.weight"], emptywts);
-    assert(conv1);
-
-    IScaleLayer* bn1 = addBatchNorm2d(network, weightMap, *conv1->getOutput(0), lname + "bn1", 1e-3);
-
-    IActivationLayer* relu1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
-    assert(relu1);
-
-    IConvolutionLayer* conv2 = network->addConvolutionNd(*relu1->getOutput(0), outch, DimsHW{3, 3}, weightMap[lname + "conv2.weight"], emptywts);
-    assert(conv2);
-    conv2->setStrideNd(DimsHW{stride, stride});
-    conv2->setPaddingNd(DimsHW{1, 1});
-
-    IScaleLayer* bn2 = addBatchNorm2d(network, weightMap, *conv2->getOutput(0), lname + "bn2", 1e-3);
-
-    IActivationLayer* relu2 = network->addActivation(*bn2->getOutput(0), ActivationType::kRELU);
-    assert(relu2);
-
-    IConvolutionLayer* conv3 = network->addConvolutionNd(*relu2->getOutput(0), outch * 4, DimsHW{1, 1}, weightMap[lname + "conv3.weight"], emptywts);
-    assert(conv3);
-
-    IScaleLayer* bn3 = addBatchNorm2d(network, weightMap, *conv3->getOutput(0), lname + "bn3", 1e-3);
-
-    IElementWiseLayer* ew1;
-    if (stride != 1 || inch != outch * 4) {
-        IConvolutionLayer* conv4 = network->addConvolutionNd(input, outch * 4, DimsHW{1, 1}, weightMap[lname + "downsample.0.weight"], emptywts);
-        assert(conv4);
-        conv4->setStrideNd(DimsHW{stride, stride});
-
-        IScaleLayer* bn4 = addBatchNorm2d(network, weightMap, *conv4->getOutput(0), lname + "downsample.1", 1e-3);
-        ew1 = network->addElementWise(*bn4->getOutput(0), *bn3->getOutput(0), ElementWiseOperation::kSUM);
-    } else {
-        ew1 = network->addElementWise(input, *bn3->getOutput(0), ElementWiseOperation::kSUM);
-    }
-    IActivationLayer* relu3 = network->addActivation(*ew1->getOutput(0), ActivationType::kRELU);
-    assert(relu3);
-    return relu3;
-}
-
-// Creat the engine using only the API and not any parser.
 ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilderConfig* config, DataType dt)
 {
     INetworkDefinition* network = builder->createNetworkV2(0U);
@@ -159,63 +83,22 @@ ICudaEngine* createEngine(unsigned int maxBatchSize, IBuilder* builder, IBuilder
     ITensor* data = network->addInput(INPUT_BLOB_NAME, dt, Dims3{64, INPUT_H, INPUT_W});
     assert(data);
 
-    std::map<std::string, Weights> weightMap = loadWeights("../yolov5s.wts");
+    std::map<std::string, Weights> weightMap = loadWeights("../resnet17.wts");
     Weights emptywts{DataType::kFLOAT, nullptr, 0};
 
-    /*
-    IConvolutionLayer* conv1 = network->addConvolutionNd(*data, 64, DimsHW{7, 7}, weightMap["conv1.weight"], emptywts);
+    IConvolutionLayer* conv1 = network->addConvolutionNd(*data, 256, DimsHW{1, 1}, weightMap["conv1.weight"], emptywts);
     assert(conv1);
-    conv1->setStrideNd(DimsHW{2, 2});
-    conv1->setPaddingNd(DimsHW{3, 3});
+    conv1->setStrideNd(DimsHW{1, 1});
+    conv1->setPaddingNd(DimsHW{0, 0});
 
-    IScaleLayer* bn1 = addBatchNorm2d(network, weightMap, *conv1->getOutput(0), "bn1", 1e-5);
-
-    // Add activation layer using the ReLU algorithm.
-    IActivationLayer* relu1 = network->addActivation(*bn1->getOutput(0), ActivationType::kRELU);
-    assert(relu1);
-
-    // Add max pooling layer with stride of 2x2 and kernel size of 2x2.
-    IPoolingLayer* pool1 = network->addPoolingNd(*relu1->getOutput(0), PoolingType::kMAX, DimsHW{3, 3});
-    assert(pool1);
-    pool1->setStrideNd(DimsHW{2, 2});
-    pool1->setPaddingNd(DimsHW{1, 1});
-    */
-
-    IActivationLayer* x = bottleneck(network, weightMap, *data, 64, 64, 1, "backbone.layer1.0.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 256, 64, 1, "backbone.layer1.1.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 256, 64, 1, "backbone.layer1.2.");
-
-    /*
-    x = bottleneck(network, weightMap, *x->getOutput(0), 256, 128, 2, "layer2.0.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 512, 128, 1, "layer2.1.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 512, 128, 1, "layer2.2.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 512, 128, 1, "layer2.3.");
-
-    x = bottleneck(network, weightMap, *x->getOutput(0), 512, 256, 2, "layer3.0.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 256, 1, "layer3.1.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 256, 1, "layer3.2.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 256, 1, "layer3.3.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 256, 1, "layer3.4.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 256, 1, "layer3.5.");
-
-    x = bottleneck(network, weightMap, *x->getOutput(0), 1024, 512, 2, "layer4.0.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 2048, 512, 1, "layer4.1.");
-    x = bottleneck(network, weightMap, *x->getOutput(0), 2048, 512, 1, "layer4.2.");
-
-    IPoolingLayer* pool2 = network->addPoolingNd(*x->getOutput(0), PoolingType::kAVERAGE, DimsHW{7, 7});
-    assert(pool2);
-    pool2->setStrideNd(DimsHW{1, 1});
-    
-    IFullyConnectedLayer* fc1 = network->addFullyConnected(*pool2->getOutput(0), 1000, weightMap["fc.weight"], weightMap["fc.bias"]);
-    assert(fc1);*/
-
-    x->getOutput(0)->setName(OUTPUT_BLOB_NAME);
+    conv1->getOutput(0)->setName(OUTPUT_BLOB_NAME);
     std::cout << "set name out" << std::endl;
-    network->markOutput(*x->getOutput(0));
+    network->markOutput(*conv1->getOutput(0));
+
 
     // Build engine
     builder->setMaxBatchSize(maxBatchSize);
-    config->setMaxWorkspaceSize(1 << 20);
+    config->setMaxWorkspaceSize(1 << 25);
     ICudaEngine* engine = builder->buildEngineWithConfig(*network, *config);
     std::cout << "build out" << std::endl;
 
@@ -273,7 +156,7 @@ void doInference(IExecutionContext& context, float* input, float* output, int ba
     CHECK(cudaStreamCreate(&stream));
 
     // DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
-    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 64 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
+    CHECK(cudaMemcpyAsync(buffers[inputIndex], input, batchSize * 3 * INPUT_H * INPUT_W * sizeof(float), cudaMemcpyHostToDevice, stream));
     context.enqueue(batchSize, buffers, stream, nullptr);
     CHECK(cudaMemcpyAsync(output, buffers[outputIndex], batchSize * OUTPUT_SIZE * sizeof(float), cudaMemcpyDeviceToHost, stream));
     cudaStreamSynchronize(stream);
@@ -288,8 +171,8 @@ int main(int argc, char** argv)
 {
     if (argc != 2) {
         std::cerr << "arguments not right!" << std::endl;
-        std::cerr << "./resnet -s   // serialize model to plan file" << std::endl;
-        std::cerr << "./resnet -d   // deserialize plan file and run inference" << std::endl;
+        std::cerr << "./resnet18 -s   // serialize model to plan file" << std::endl;
+        std::cerr << "./resnet18 -d   // deserialize plan file and run inference" << std::endl;
         return -1;
     }
 
@@ -302,7 +185,7 @@ int main(int argc, char** argv)
         APIToModel(1, &modelStream);
         assert(modelStream != nullptr);
 
-        std::ofstream p("resnet50.engine", std::ios::binary);
+        std::ofstream p("resnet18.engine", std::ios::binary);
         if (!p)
         {
             std::cerr << "could not open plan output file" << std::endl;
@@ -312,7 +195,7 @@ int main(int argc, char** argv)
         modelStream->destroy();
         return 1;
     } else if (std::string(argv[1]) == "-d") {
-        std::ifstream file("resnet50.engine", std::ios::binary);
+        std::ifstream file("resnet18.engine", std::ios::binary);
         if (file.good()) {
             file.seekg(0, file.end);
             size = file.tellg();
